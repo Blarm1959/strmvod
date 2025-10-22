@@ -624,10 +624,21 @@ class Plugin:
         """Build proxy URL for episode."""
         return f"http://{normalize_host(host)}/proxy/vod/episode/{uuid}"
     
-    def _cleanup_stale_files(self,root: str,live_paths: Set[str],logger: Any,dry_run: bool) -> Tuple[int, List[str]]:
+
+
+    def _cleanup_stale_files(
+        self,
+        root: str,
+        live_paths: Set[str],
+        logger: Any,
+        dry_run: bool,
+        *,
+        allow_root_delete: bool = False,  # explicit root protection (default: keep root)
+    ) -> Tuple[int, List[str]]:
         """
-        Remove .strm files not in live_paths and then remove any directory tree
-        that contains no .strm files anywhere in its subtree.
+        Remove .strm files not in live_paths and, in the same pass, remove any dir
+        whose subtree contains no .strm files anywhere. The root dir is preserved
+        unless allow_root_delete=True.
     
         Returns:
             removed_count: number of .strm files removed
@@ -636,41 +647,66 @@ class Plugin:
         removed_count = 0
         notes: List[str] = []
     
-        # 1) Remove stale .strm files
-        for dirpath, _, files in os.walk(root):
-            for filename in files:
-                if not filename.lower().endswith(".strm"):
-                    continue
-                filepath = os.path.normpath(os.path.join(dirpath, filename))
-                if filepath not in live_paths:
-                    if dry_run:
-                        notes.append(f"dry_remove: {filepath}")
-                        continue
-                    try:
-                        os.remove(filepath)
-                        removed_count += 1
-                        notes.append(f"removed: {filepath}")
-                    except Exception as e:
-                        notes.append(f"remove_failed: {filepath} ({e})")
+        # Normalize for reliable comparisons (normpath + normcase helps on Windows).
+        norm = lambda p: os.path.normcase(os.path.normpath(p))
+        root_norm = norm(root)
+        live_paths_norm = {norm(p) for p in live_paths}
     
-        # 2) Remove any directory tree that has no .strm files at all
-        contains_strm: dict[str, bool] = {}
+        # Track whether each processed dir's subtree has any live .strm.
+        contains_strm: Dict[str, bool] = {}
     
+        # Bottom-up walk so children's state is known before deciding on parent.
         for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-            has_strm_here = any(f.lower().endswith(".strm") for f in filenames)
-            has_strm_in_children = any(contains_strm.get(os.path.join(dirpath, d), False) for d in dirnames)
-            subtree_has_strm = has_strm_here or has_strm_in_children
-            contains_strm[dirpath] = subtree_has_strm
+            dirpath_norm = norm(dirpath)
     
+            # 1) Remove stale .strm files in this dir
+            strm_files = [f for f in filenames if f.lower().endswith(".strm")]
+            for f in strm_files:
+                file_abs = os.path.join(dirpath, f)
+                file_norm = norm(file_abs)
+                if file_norm not in live_paths_norm:
+                    if dry_run:
+                        notes.append(f"dry_remove: {file_abs}")
+                    else:
+                        try:
+                            os.remove(file_abs)
+                            removed_count += 1
+                            notes.append(f"removed: {file_abs}")
+                        except Exception as e:
+                            notes.append(f"remove_failed: {file_abs} ({e})")
+    
+            # 2) Determine if this dir's subtree contains any live .strm files
+            #    (stale ones were/would be removed above).
+            has_live_strm_here = any(
+                norm(os.path.join(dirpath, f)) in live_paths_norm
+                for f in strm_files
+            )
+            has_strm_in_children = any(
+                contains_strm.get(norm(os.path.join(dirpath, d)), False)
+                for d in dirnames
+            )
+            subtree_has_strm = has_live_strm_here or has_strm_in_children
+            contains_strm[dirpath_norm] = subtree_has_strm
+    
+            # 3) If no .strm anywhere in this dir's subtree, remove the dir
+            is_root = (dirpath_norm == root_norm)
             if not subtree_has_strm:
+                # Protect root dir unless explicitly allowed
+                if is_root and not allow_root_delete:
+                    if dry_run:
+                        notes.append(f"skip root dir (no .strm anywhere): {dirpath}")
+                    else:
+                        notes.append(f"skipped root dir (no .strm anywhere): {dirpath}")
+                    continue
+    
                 if dry_run:
-                    notes.append(f"dry_remove tree (no .strm anywhere): {dirpath}")
+                    notes.append(f"dry_remove dir (no .strm anywhere): {dirpath}")
                 else:
                     try:
                         shutil.rmtree(dirpath)
-                        notes.append(f"removed tree (no .strm anywhere): {dirpath}")
+                        notes.append(f"removed dir (no .strm anywhere): {dirpath}")
                     except Exception as e:
-                        notes.append(f"failed to remove tree: {dirpath} ({e})")
+                        notes.append(f"failed to remove dir: {dirpath} ({e})")
     
         return removed_count, notes
     
@@ -989,3 +1025,4 @@ plugin = Plugin()
 fields = Plugin.fields
 
 actions = Plugin.actions
+

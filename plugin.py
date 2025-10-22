@@ -623,11 +623,20 @@ class Plugin:
     def _build_episode_url(self, host: str, uuid: str) -> str:
         """Build proxy URL for episode."""
         return f"http://{normalize_host(host)}/proxy/vod/episode/{uuid}"
-
-    def _cleanup_stale_files(self, root: str, live_paths: Set[str], logger: Any, dry_run: bool) -> Tuple[int, List[str]]:
-        """Remove .strm files and empty directories not in live_paths set."""
+    
+    def _cleanup_stale_files(self,root: str,live_paths: Set[str],logger: Any,dry_run: bool) -> Tuple[int, List[str]]:
+        """
+        Remove .strm files not in live_paths and then remove any directory tree
+        that contains no .strm files anywhere in its subtree.
+    
+        Returns:
+            removed_count: number of .strm files removed
+            notes: log of actions and failures
+        """
         removed_count = 0
-        notes = []
+        notes: List[str] = []
+    
+        # 1) Remove stale .strm files
         for dirpath, _, files in os.walk(root):
             for filename in files:
                 if not filename.lower().endswith(".strm"):
@@ -643,16 +652,28 @@ class Plugin:
                         notes.append(f"removed: {filepath}")
                     except Exception as e:
                         notes.append(f"remove_failed: {filepath} ({e})")
-        if removed_count > 0 and not dry_run:
-            for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-                if not dirnames and not filenames:
+    
+        # 2) Remove any directory tree that has no .strm files at all
+        contains_strm: dict[str, bool] = {}
+    
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            has_strm_here = any(f.lower().endswith(".strm") for f in filenames)
+            has_strm_in_children = any(contains_strm.get(os.path.join(dirpath, d), False) for d in dirnames)
+            subtree_has_strm = has_strm_here or has_strm_in_children
+            contains_strm[dirpath] = subtree_has_strm
+    
+            if not subtree_has_strm:
+                if dry_run:
+                    notes.append(f"dry_remove tree (no .strm anywhere): {dirpath}")
+                else:
                     try:
-                        os.rmdir(dirpath)
-                        notes.append(f"removed empty dir: {dirpath}")
-                    except OSError as e:
-                        notes.append(f"failed to remove empty dir: {dirpath} ({e})")
+                        shutil.rmtree(dirpath)
+                        notes.append(f"removed tree (no .strm anywhere): {dirpath}")
+                    except Exception as e:
+                        notes.append(f"failed to remove tree: {dirpath} ({e})")
+    
         return removed_count, notes
-
+    
     def _write_movies(self, settings: Dict[str, Any], logger: Any, token: str, relogin_callback: Callable) -> Dict[str, Any]:
         """Write .strm files for movies."""
         root = settings.get("movies_root", "/VODs/movies")
@@ -966,4 +987,5 @@ class Plugin:
 # Plugin exports
 plugin = Plugin()
 fields = Plugin.fields
+
 actions = Plugin.actions
